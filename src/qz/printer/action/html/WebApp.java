@@ -26,6 +26,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import qz.App;
 import qz.common.Constants;
+import qz.utils.ArgValue;
+import qz.utils.PrefsSearch;
 import qz.utils.SystemUtilities;
 import qz.ws.PrintSocketServer;
 
@@ -63,6 +65,12 @@ public class WebApp extends Application {
 
     private static CountDownLatch startupLatch;
     private static CountDownLatch captureLatch;
+    // token for the job currently using the WebView; null when idle or aborted, so late events from an old job are ignored
+    private static volatile Object activeJob = null;
+    // the job whose page has already loaded and is being captured/printed, so a page that reloads itself can't start it twice
+    private static Object renderingJob = null;
+    // set (on the JavaFX thread) while a new job stops whatever the WebView was still doing, so that cancellation isn't blamed on the new job
+    private static boolean replacingPage = false;
 
     private static IntPredicate printAction;
     private static final AtomicReference<Throwable> thrown = new AtomicReference<>();
@@ -76,12 +84,35 @@ public class WebApp extends Application {
     //listens for a Succeeded state to activate image capture
     private static ChangeListener<Worker.State> stateListener = (ov, oldState, newState) -> {
         log.trace("New state: {} > {}", oldState, newState);
+        if (activeJob == null) {
+            log.trace("Ignoring state {}, no active job", newState);
+            return;
+        }
+        if (renderingJob == activeJob) {
+            // The page already loaded and is being captured/printed, but it's navigating again (e.g. scripts calling
+            // location.reload()). Stop that navigation so the loaded page stays in place, and don't let it affect the job.
+            if (newState == Worker.State.SCHEDULED) {
+                log.warn("Page started loading again while being captured (it may reload itself), stopping it");
+                final Object job = activeJob;
+                Platform.runLater(() -> {
+                    if (job == activeJob) { webView.getEngine().getLoadWorker().cancel(); }
+                });
+            }
+            log.trace("Ignoring state {}, page is already being captured", newState);
+            return;
+        }
 
         // Cancelled should probably throw exception listener, but does not
         if (newState == Worker.State.CANCELLED) {
+            if (replacingPage) {
+                // The previous page (e.g. one that reloads itself, or the blank page left by the last job) was still
+                // loading when this job started; stopping it is expected and isn't a failure of this job
+                log.trace("Stopped previous page load to start the next job");
+                return;
+            }
             // This can happen for file downloads, e.g. "response-content-disposition=attachment"
             // See https://github.com/qzind/tray/issues/1183
-            unlatch(new IOException("Page load was cancelled for an unknown reason"));
+            unlatch(activeJob, new IOException("Page load was cancelled for an unknown reason"));
         }
         if (newState == Worker.State.SUCCEEDED) {
             boolean hasBody = (boolean)webView.getEngine().executeScript("document.body != null");
@@ -122,12 +153,16 @@ public class WebApp extends Application {
 
             webView.autosize();
 
+            // bind the timer to this job, so it stops if the job is aborted or replaced
+            final Object job = activeJob;
+            final IntPredicate action = printAction;
+            renderingJob = job;
             Platform.runLater(() -> new AnimationTimer() {
                 int frames = 0;
 
                 @Override
                 public void handle(long l) {
-                    if (printAction.test(++frames)) {
+                    if (job != activeJob || action.test(++frames)) {
                         stop();
                     }
                 }
@@ -142,7 +177,13 @@ public class WebApp extends Application {
 
     //listens for failures
     private static ChangeListener<Throwable> exceptListener = (obs, oldExc, newExc) -> {
-        if (newExc != null) { unlatch(newExc); }
+        if (newExc == null) { return; }
+        if (activeJob != null && renderingJob == activeJob) {
+            // a later navigation by the page failed, the page being captured is unaffected
+            log.warn("Ignoring page load error after the page loaded: {}", newExc.toString());
+            return;
+        }
+        unlatch(activeJob, newExc);
     };
 
 
@@ -268,6 +309,7 @@ public class WebApp extends Application {
      */
     public static synchronized void print(final PrinterJob job, final WebAppModel model) throws Throwable {
         model.setZoom(1); //vector prints do not need to use zoom
+        final Object token = new Object();
 
         // prevents blank pages
         Platform.runLater(() -> {
@@ -275,7 +317,7 @@ public class WebApp extends Application {
             stage.toBack();
         });
 
-        load(model, (int frames) -> {
+        load(model, token, (int frames) -> {
             if(frames >= VECTOR_FRAMES) {
                 try {
                     double printScale = 72d / 96d;
@@ -328,23 +370,22 @@ public class WebApp extends Application {
                         } finally {
                             webView.getTransforms().clear();
                         }
-                        unlatch(possiblyThrown);
+                        unlatch(token, possiblyThrown);
                     });
                 } catch(Exception e) {
-                    unlatch(e);
+                    unlatch(token, e);
                 }
             }
             return frames >= VECTOR_FRAMES;
         });
 
         log.trace("Waiting on print..");
-        captureLatch.await(); //released when unlatch is called
-
-        if (thrown.get() != null) { throw thrown.get(); }
+        awaitCompletion(model);
     }
 
     public static synchronized BufferedImage raster(final WebAppModel model) throws Throwable {
         AtomicReference<BufferedImage> capture = new AtomicReference<>();
+        final Object job = new Object();
 
         //ensure JavaFX has started before we run
         if (startupLatch.getCount() > 0) {
@@ -357,7 +398,7 @@ public class WebApp extends Application {
             stage.toBack();
         });
 
-        load(model, (int frames) -> {
+        load(model, job, (int frames) -> {
             if (frames == CAPTURE_FRAMES) {
                 log.debug("Attempting image capture");
 
@@ -375,7 +416,7 @@ public class WebApp extends Application {
                         finally {
                             Toolkit.getToolkit().removePostSceneTkPulseListener(this);
                         }
-                        unlatch(possiblyThrown);
+                        unlatch(job, possiblyThrown);
                     }
                 });
                 Toolkit.getToolkit().requestNextPulse();
@@ -385,9 +426,7 @@ public class WebApp extends Application {
         });
 
         log.trace("Waiting on capture..");
-        captureLatch.await(); //released when unlatch is called
-
-        if (thrown.get() != null) { throw thrown.get(); }
+        awaitCompletion(model);
 
         return capture.get();
     }
@@ -396,13 +435,20 @@ public class WebApp extends Application {
      * Prints the loaded source specified in the passed {@code model}.
      *
      * @param model  The model specifying the web page parameters.
+     * @param job    Token identifying this job; callbacks from any other (aborted) job are ignored.
      * @param action EventHandler that will be ran when the WebView completes loading.
      */
-    private static synchronized void load(WebAppModel model, IntPredicate action) {
+    private static synchronized void load(WebAppModel model, Object job, IntPredicate action) {
         captureLatch = new CountDownLatch(1);
         thrown.set(null);
+        activeJob = job;
 
         Platform.runLater(() -> {
+            if (activeJob != job) {
+                log.warn("HTML job was aborted before it started loading");
+                return;
+            }
+
             //zoom should only be factored on raster prints
             pageZoom = model.getZoom();
             pageWidth = model.getWebWidth();
@@ -415,12 +461,74 @@ public class WebApp extends Application {
 
             printAction = action;
 
-            if (model.isPlainText()) {
-                webView.getEngine().loadContent(model.getSource(), "text/html");
-            } else {
-                webView.getEngine().load(model.getSource());
+            // Stopping any load still in progress (and the one replaced by the load below) fires CANCELLED, which
+            // belongs to the previous page, not to this job
+            replacingPage = true;
+            try {
+                webView.getEngine().getLoadWorker().cancel();
+                if (model.isPlainText()) {
+                    webView.getEngine().loadContent(model.getSource(), "text/html");
+                } else {
+                    webView.getEngine().load(model.getSource());
+                }
+            }
+            finally {
+                replacingPage = false;
             }
         });
+    }
+
+    /**
+     * Waits for the whole job (page load, render and capture/print) to finish, bounded by {@code print.html.timeout}.
+     * If the job is still running when the timeout expires, it is aborted regardless of its state, so that
+     * subsequent HTML jobs are never blocked behind it (e.g. a script or resource that never responds).
+     */
+    private static void awaitCompletion(WebAppModel model) throws Throwable {
+        int timeout = PrefsSearch.getInt(ArgValue.PRINT_HTML_TIMEOUT, App.getTrayProperties());
+        if (timeout > 0) {
+            if (!captureLatch.await(timeout, TimeUnit.SECONDS)) {
+                String source = model.isPlainText()? "HTML content":model.getSource();
+                log.error("HTML job for {} did not finish within {} seconds, aborting", source, timeout);
+                abort();
+                throw new IOException(String.format("HTML job did not finish within %s seconds and was aborted. " +
+                                                            "Check the page for scripts or resources that never respond (%s)",
+                                                    timeout, source));
+            }
+        } else {
+            captureLatch.await(); //released when unlatch is called
+        }
+
+        if (thrown.get() != null) { throw thrown.get(); }
+    }
+
+    /**
+     * Abandons the active job whatever state it is in, and resets the WebView so it's ready for the next job
+     */
+    private static void abort() {
+        activeJob = null; // from here on, any callbacks from the abandoned job are ignored
+
+        CountDownLatch aborted = new CountDownLatch(1);
+        Platform.runLater(() -> {
+            try {
+                webView.getEngine().getLoadWorker().cancel();
+                webView.getTransforms().clear();
+                clearPage();
+                stage.hide();
+            }
+            catch(Throwable t) {
+                log.warn("Failed to cleanly abort HTML job", t);
+            }
+            finally {
+                aborted.countDown();
+            }
+        });
+
+        try {
+            if (!aborted.await(10, TimeUnit.SECONDS)) {
+                log.warn("JavaFX thread did not respond while aborting HTML job; it may be blocked by the page or printer");
+            }
+        }
+        catch(InterruptedException ignore) {}
     }
 
     private static double findHeight() {
@@ -457,12 +565,41 @@ public class WebApp extends Application {
      * Final cleanup when no longer capturing
      */
     public static void unlatch(Throwable t) {
+        unlatch(activeJob, t);
+    }
+
+    private static void unlatch(Object job, Throwable t) {
+        if (job == null || job != activeJob) {
+            log.debug("Ignoring completion of an aborted HTML job", t);
+            return;
+        }
+        activeJob = null;
+
         if (t != null) {
             thrown.set(t);
         }
 
+        clearPage();
         captureLatch.countDown();
         stage.hide();
+    }
+
+    /**
+     * Replaces the page with a blank one, so the finished page's scripts stop running between jobs
+     * (e.g. pages that keep reloading themselves or polling a server that isn't there).
+     * Load events from the blank page are ignored, as no job is active.
+     */
+    private static void clearPage() {
+        // Deferred, as this can be called from within a pulse; runs before the next job's load, which is queued after it
+        Platform.runLater(() -> {
+            if (activeJob != null) { return; } // the next job has already started
+            try {
+                webView.getEngine().loadContent("");
+            }
+            catch(Throwable t) {
+                log.warn("Failed to clear the HTML page", t);
+            }
+        });
     }
 
     public static Version getWebkitVersion() {

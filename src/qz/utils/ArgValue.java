@@ -118,7 +118,9 @@ public enum ArgValue {
     PRINTER_DETAILS_DEBUG(PREFERENCES, "Debug printer details to the logs as they're crawled.  Helpful for debugging driver-related hard-crashes.", null, false,
         "printer.details.debug"),
     PRINTER_STATUS_JOB_DATA(PREFERENCES, "Return all raw (binary) job data with job statuses (use with caution)", null, false,
-        "printer.status.jobdata");
+        "printer.status.jobdata"),
+    PRINT_HTML_TIMEOUT(PREFERENCES, "Maximum time (in seconds) an HTML print or render may take, from page load to completion, before it is aborted.  Use 0 to wait forever.", null, 5,
+        "print.html.timeout");
 
     private ArgType argType;
     private String description;
